@@ -19,6 +19,7 @@
  FOR A PARTICULAR PURPOSE.  See the license for more details.
 */
 
+#include <ql/cashflows/fixedratecoupon.hpp>
 #include <ql/math/distributions/normaldistribution.hpp>
 #include <ql/math/integrals/segmentintegral.hpp>
 #include <ql/math/solvers1d/brent.hpp>
@@ -170,11 +171,12 @@ namespace QuantLib {
                                 Real w,
                                 Real start,
                                 std::vector<Time> payTimes,
+                                std::vector<Time> accrualTimes,
                                 Rate fixedRate,
                                 const G2& model)
         : a_(a), sigma_(sigma), b_(b), eta_(eta), rho_(rho), w_(w), T_(start),
-          t_(std::move(payTimes)), rate_(fixedRate), size_(t_.size()), A_(size_), Ba_(size_),
-          Bb_(size_) {
+          t_(std::move(payTimes)), tau_(std::move(accrualTimes)), rate_(fixedRate),
+          size_(t_.size()), A_(size_), Ba_(size_), Bb_(size_) {
 
 
             sigmax_ = sigma_*std::sqrt(0.5*(1.0-std::exp(-2.0*a_*T_))/a_);
@@ -211,8 +213,7 @@ namespace QuantLib {
             Array lambda(size_);
             Size i;
             for (i=0; i<size_; i++) {
-                Real tau = (i==0 ? t_[0] - T_ : t_[i] - t_[i-1]);
-                Real c = (i==size_-1 ? Real(1.0+rate_*tau) : rate_*tau);
+                Real c = (i==size_-1 ? Real(1.0+rate_*tau_[i]) : Real(rate_*tau_[i]));
                 lambda[i] = c*A_[i]*std::exp(-Ba_[i]*x);
             }
 
@@ -260,7 +261,7 @@ namespace QuantLib {
 
         Real a_, sigma_, b_, eta_, rho_, w_;
         Time T_;
-        std::vector<Time> t_;
+        std::vector<Time> t_, tau_;
         Rate rate_;
         Size size_;
         Array A_, Ba_, Bb_;
@@ -279,15 +280,21 @@ namespace QuantLib {
                                              arguments.floatingResetDates[0]);
         Real w = (arguments.type==Swap::Payer ? 1 : -1 );
 
-        std::vector<Time> fixedPayTimes(arguments.fixedPayDates.size());
-        for (Size i=0; i<fixedPayTimes.size(); ++i)
-            fixedPayTimes[i] =
-                dayCounter.yearFraction(settlement,
-                                        arguments.fixedPayDates[i]);
+        // The curve day counter converts payment dates into times, but the
+        // coupons accrue over their own periods in the fixed-leg day count.
+        QL_REQUIRE(arguments.swap, "underlying swap not set");
+        const Leg& fixedLeg = arguments.swap->fixedLeg();
+        std::vector<Time> fixedPayTimes(fixedLeg.size()), accrualTimes(fixedLeg.size());
+        for (Size i=0; i<fixedLeg.size(); ++i) {
+            auto coupon = ext::dynamic_pointer_cast<FixedRateCoupon>(fixedLeg[i]);
+            QL_REQUIRE(coupon, "fixed-rate coupon expected in the fixed leg");
+            fixedPayTimes[i] = dayCounter.yearFraction(settlement, coupon->date());
+            accrualTimes[i] = coupon->accrualPeriod();
+        }
 
         SwaptionPricingFunction function(a(), sigma(), b(), eta(), rho(),
                                          w, start,
-                                         fixedPayTimes,
+                                         fixedPayTimes, accrualTimes,
                                          fixedRate, (*this));
 
         Real upper = function.mux() + range*function.sigmax();

@@ -24,12 +24,17 @@
 #include "toplevelfixture.hpp"
 #include "utilities.hpp"
 #include <ql/cashflows/iborcoupon.hpp>
+#include <ql/currencies/europe.hpp>
+#include <ql/exercise.hpp>
+#include <ql/instruments/swaption.hpp>
 #include <ql/models/shortrate/onefactormodels/hullwhite.hpp>
 #include <ql/models/shortrate/onefactormodels/vasicek.hpp>
 #include <ql/models/shortrate/onefactormodels/coxingersollross.hpp>
 #include <ql/models/shortrate/onefactormodels/extendedcoxingersollross.hpp>
 #include <ql/models/shortrate/twofactormodels/g2.hpp>
 #include <ql/models/shortrate/calibrationhelpers/swaptionhelper.hpp>
+#include <ql/pricingengines/swaption/fdg2swaptionengine.hpp>
+#include <ql/pricingengines/swaption/g2swaptionengine.hpp>
 #include <ql/pricingengines/swaption/jamshidianswaptionengine.hpp>
 #include <ql/pricingengines/swap/treeswapengine.hpp>
 #include <ql/pricingengines/swap/discountingswapengine.hpp>
@@ -45,6 +50,7 @@
 #include <ql/time/daycounters/actual365fixed.hpp>
 #include <ql/time/schedule.hpp>
 #include <ql/quotes/simplequote.hpp>
+#include <ql/utilities/dataformatters.hpp>
 
 using namespace QuantLib;
 using namespace boost::unit_test_framework;
@@ -769,6 +775,240 @@ BOOST_AUTO_TEST_CASE(testVasicekDiscountBondOptionForSmallMeanReversion) {
                             << "\n  error         : " << error
                             << "\n  tolerance     : " << tolerance);
             }
+        }
+    }
+}
+
+struct G2SwaptionData {
+    Date startDate, maturity;
+    Handle<YieldTermStructure> termStructure;
+    ext::shared_ptr<IborIndex> index;
+    Real nominal = 1000000.0;
+
+    // 1Y x 10Y swaps with annual fixed and semiannual floating payments.  The index
+    // has no fixing days and the swaptions are exercised at the start of the swap, as
+    // G2SwaptionEngine assumes.  The curve is Act/365F; the tests use different day
+    // counters for the fixed leg.
+    explicit G2SwaptionData(const Date& today) {
+        termStructure = Handle<YieldTermStructure>(flatRate(today, 0.04, Actual365Fixed()));
+        index = ext::make_shared<IborIndex>("G2Test", 6 * Months, 0, EURCurrency(), TARGET(),
+                                            ModifiedFollowing, false, Actual360(),
+                                            termStructure);
+        startDate = TARGET().advance(today, 1, Years);
+        maturity = TARGET().advance(startDate, 10, Years);
+    }
+
+    ext::shared_ptr<VanillaSwap> makeSwap(Swap::Type type,
+                                          Rate fixedRate,
+                                          const DayCounter& fixedDayCount,
+                                          Spread spread = 0.0) const {
+        Schedule fixedSchedule(startDate, maturity, Period(Annual), TARGET(),
+                               ModifiedFollowing, ModifiedFollowing,
+                               DateGeneration::Forward, false);
+        Schedule floatSchedule(startDate, maturity, Period(Semiannual), TARGET(),
+                               ModifiedFollowing, ModifiedFollowing,
+                               DateGeneration::Forward, false);
+        auto swap = ext::make_shared<VanillaSwap>(type, nominal, fixedSchedule, fixedRate,
+                                                  fixedDayCount, floatSchedule, index,
+                                                  spread, index->dayCounter());
+        swap->setPricingEngine(ext::make_shared<DiscountingSwapEngine>(termStructure));
+        return swap;
+    }
+
+    ext::shared_ptr<Swaption> makeSwaption(const ext::shared_ptr<VanillaSwap>& swap) const {
+        return ext::make_shared<Swaption>(swap, ext::make_shared<EuropeanExercise>(startDate));
+    }
+};
+
+BOOST_AUTO_TEST_CASE(testG2SwaptionAgainstHullWhiteLimit) {
+    BOOST_TEST_MESSAGE("Testing G2 swaption pricing against Hull-White "
+                       "for a vanishing second factor...");
+
+    const G2SwaptionData data(Settings::instance().evaluationDate());
+
+    // as eta goes to zero, G2 reduces to Hull-White with the same a and sigma
+    const Real a = 0.05, sigma = 0.01;
+    auto g2 = ext::make_shared<G2>(data.termStructure, a, sigma, 0.2, 1.0e-8, 0.0);
+    auto hullWhite = ext::make_shared<HullWhite>(data.termStructure, a, sigma);
+
+    // in this limit the integrand has a kink, hence the fine grid
+    auto g2Engine = ext::make_shared<G2SwaptionEngine>(g2, 10.0, 1000);
+    auto jamshidianEngine = ext::make_shared<JamshidianSwaptionEngine>(hullWhite);
+
+    // The relative differences stay below 1e-4.  Sizing the fixed coupons with the
+    // curve day counter gives errors of 0.2% to 0.6% for a 30/360 fixed leg and of
+    // 4% to 16% for an Act/360 one.
+    const Real tolerance = 2.0e-4;
+
+    for (const auto& fixedDayCount : std::vector<DayCounter>{
+             Actual360(), Thirty360(Thirty360::BondBasis), Actual365Fixed()}) {
+        const Rate atmRate = data.makeSwap(Swap::Payer, 0.0, fixedDayCount)->fairRate();
+        for (Real moneyness : {0.8, 1.0, 1.2}) {
+            for (Swap::Type type : {Swap::Payer, Swap::Receiver}) {
+                auto swaption =
+                    data.makeSwaption(data.makeSwap(type, moneyness * atmRate, fixedDayCount));
+
+                swaption->setPricingEngine(jamshidianEngine);
+                const Real expected = swaption->NPV();
+                swaption->setPricingEngine(g2Engine);
+                const Real calculated = swaption->NPV();
+
+                const Real error = std::fabs(calculated / expected - 1.0);
+                if (error > tolerance) {
+                    BOOST_ERROR("Failed to reproduce Hull-White swaption price with G2:"
+                                << "\n  fixed-leg day counter: " << fixedDayCount
+                                << "\n  type:                  " << type
+                                << "\n  strike:                " << io::rate(moneyness * atmRate)
+                                << std::fixed << std::setprecision(4)
+                                << "\n  calculated (G2):       " << calculated
+                                << "\n  expected (Jamshidian): " << expected
+                                << std::scientific
+                                << "\n  rel. error:            " << error
+                                << "\n  tolerance:             " << tolerance);
+                }
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(testG2SwaptionZeroVolatilityLimit) {
+    BOOST_TEST_MESSAGE("Testing G2 swaption pricing in the zero-volatility limit...");
+
+    const G2SwaptionData data(Settings::instance().evaluationDate());
+
+    // without volatility, the swaption is worth the positive part of the swap
+    auto g2 = ext::make_shared<G2>(data.termStructure, 0.1, 1.0e-8, 0.2, 1.0e-8, -0.5);
+    auto engine = ext::make_shared<G2SwaptionEngine>(g2, 6.0, 16);
+
+    // The residual time value at the money is about 3.5e-9 of the nominal.  With
+    // indexed coupons, the fixing periods of the index can differ by a few days from
+    // the accrual periods of the swap, which changes its value by up to about 2e-5
+    // of the nominal.  Sizing the fixed coupons with the curve day counter gives
+    // errors of 1.3e-4 to 5.3e-3 of the nominal.
+    const bool usingAtParCoupons = IborCoupon::Settings::instance().usingAtParCoupons();
+    const Real tolerance = (usingAtParCoupons ? 1.0e-8 : 5.0e-5) * data.nominal;
+
+    for (const auto& fixedDayCount : std::vector<DayCounter>{
+             Actual360(), Thirty360(Thirty360::BondBasis), Actual365Fixed()}) {
+        for (Spread spread : {0.0, 0.005}) {
+            const Rate atmRate =
+                data.makeSwap(Swap::Payer, 0.0, fixedDayCount, spread)->fairRate();
+            for (Real moneyness : {0.8, 1.0, 1.2}) {
+                for (Swap::Type type : {Swap::Payer, Swap::Receiver}) {
+                    auto swap = data.makeSwap(type, moneyness * atmRate, fixedDayCount, spread);
+                    const Real expected = std::max<Real>(swap->NPV(), 0.0);
+
+                    auto swaption = data.makeSwaption(swap);
+                    swaption->setPricingEngine(engine);
+                    const Real calculated = swaption->NPV();
+
+                    const Real error = std::fabs(calculated - expected);
+                    if (error > tolerance) {
+                        BOOST_ERROR("Failed to reproduce zero-volatility swaption price:"
+                                    << "\n  fixed-leg day counter: " << fixedDayCount
+                                    << "\n  type:                  " << type
+                                    << "\n  strike:                "
+                                    << io::rate(moneyness * atmRate)
+                                    << "\n  spread:                " << io::rate(spread)
+                                    << std::fixed << std::setprecision(4)
+                                    << "\n  calculated:            " << calculated
+                                    << "\n  expected:              " << expected
+                                    << "\n  error:                 " << error
+                                    << "\n  tolerance:             " << tolerance);
+                    }
+                }
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(testG2SwaptionAgainstFiniteDifferences) {
+    BOOST_TEST_MESSAGE("Testing G2 analytic swaption pricing against finite differences...");
+
+    const G2SwaptionData data(Settings::instance().evaluationDate());
+
+    auto g2 = ext::make_shared<G2>(data.termStructure, 0.1, 0.01, 0.2, 0.013, -0.5);
+    auto analyticEngine = ext::make_shared<G2SwaptionEngine>(g2, 6.0, 16);
+    auto fdEngine = ext::make_shared<FdG2SwaptionEngine>(g2, 50, 75, 75);
+
+    // On this grid the finite-difference prices are within 0.8% of the analytic
+    // ones; the difference decreases as the grid is refined, to below 0.1% at the
+    // money on a 200x200x200 grid.  Sizing the fixed coupons with the curve day
+    // counter instead of the Act/360 accruals gives errors of 8% to 18%.
+    const Real tolerance = 1.0e-2;
+
+    const DayCounter fixedDayCount = Actual360();
+    const Rate atmRate = data.makeSwap(Swap::Payer, 0.0, fixedDayCount)->fairRate();
+    for (Real moneyness : {0.9, 1.0, 1.1}) {
+        for (Swap::Type type : {Swap::Payer, Swap::Receiver}) {
+            auto swaption =
+                data.makeSwaption(data.makeSwap(type, moneyness * atmRate, fixedDayCount));
+
+            swaption->setPricingEngine(fdEngine);
+            const Real expected = swaption->NPV();
+            swaption->setPricingEngine(analyticEngine);
+            const Real calculated = swaption->NPV();
+
+            const Real error = std::fabs(calculated / expected - 1.0);
+            if (error > tolerance) {
+                BOOST_ERROR("Failed to reproduce finite-difference G2 swaption price:"
+                            << "\n  fixed-leg day counter: " << fixedDayCount
+                            << "\n  type:                  " << type
+                            << "\n  strike:                " << io::rate(moneyness * atmRate)
+                            << std::fixed << std::setprecision(4)
+                            << "\n  calculated (analytic): " << calculated
+                            << "\n  expected (FD):         " << expected
+                            << std::scientific
+                            << "\n  rel. error:            " << error
+                            << "\n  tolerance:             " << tolerance);
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(testG2SwaptionCachedValues) {
+    BOOST_TEST_MESSAGE("Testing G2 analytic swaption pricing against cached values...");
+
+    Settings::instance().evaluationDate() = Date(16, September, 2015);
+    const G2SwaptionData data(Settings::instance().evaluationDate());
+
+    auto g2 = ext::make_shared<G2>(data.termStructure, 0.1, 0.01, 0.2, 0.013, -0.5);
+    auto engine = ext::make_shared<G2SwaptionEngine>(g2, 6.0, 16);
+
+    // With the curve day counter on the fixed leg, the accrual periods equal the
+    // differences of the payment times, so the results must not change; the cached
+    // values were computed with the previous implementation, which used the latter.
+    struct Case {
+        Rate strike;
+        Swap::Type type;
+        Real expected;
+    };
+    const Case cases[] = {
+        { 0.03, Swap::Payer,    84605.0987713645 },
+        { 0.03, Swap::Receiver, 666.209229255677 },
+        { 0.04, Swap::Payer,    22199.2579282453 },
+        { 0.04, Swap::Receiver, 15900.5497518798 },
+        { 0.05, Swap::Payer,    1454.15736261179 },
+        { 0.05, Swap::Receiver, 72795.6305519897 }
+    };
+
+    const Real tolerance = 1.0e-8;
+    for (const auto& c : cases) {
+        auto swaption = data.makeSwaption(data.makeSwap(c.type, c.strike, Actual365Fixed()));
+        swaption->setPricingEngine(engine);
+        const Real calculated = swaption->NPV();
+
+        const Real error = std::fabs(calculated / c.expected - 1.0);
+        if (error > tolerance) {
+            BOOST_ERROR("Failed to reproduce cached G2 swaption price:"
+                        << "\n  type:       " << c.type
+                        << "\n  strike:     " << io::rate(c.strike)
+                        << std::setprecision(15)
+                        << "\n  calculated: " << calculated
+                        << "\n  expected:   " << c.expected
+                        << std::scientific
+                        << "\n  rel. error: " << error
+                        << "\n  tolerance:  " << tolerance);
         }
     }
 }
